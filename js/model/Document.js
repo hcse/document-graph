@@ -1,3 +1,5 @@
+const { DataTypes } = require('../const')
+const { Util } = require('../util')
 
 const schema =
     `
@@ -19,12 +21,14 @@ const schema =
         value
         type
         content_sequence
+        document
       }
       
       type Certificate {
         certifier
         notes
         certification_date
+        certification_sequence
       }
       
       hash: string @index(exact) .
@@ -40,10 +44,33 @@ const schema =
       value: string @index(term) .
       type: string @index(term) .
       content_sequence: int .
+      document: [uid] .
       
       certifier: string @index(term) .
       notes: string .
       certification_date: datetime .
+      certification_sequence: int .
+    `
+const contentGroupsRequest = `
+      content_groups (orderasc:content_group_sequence){
+        content_group_sequence
+        contents (orderasc: content_sequence){
+          content_sequence
+          label
+          value
+          type
+          document{
+            expand(_all_)
+          }
+        }
+      },
+    `
+
+const certificatesRequest = `
+      certificates (orderasc: certification_sequence){
+        uid
+        expand(_all_)
+      },
     `
 
 class Document {
@@ -75,26 +102,57 @@ class Document {
     return documents
   }
 
-  async getUID (docHash) {
+  async getByHash (docHash, opts) {
     const { documents } = await this.dgraph.query(
-      `query documents ($hash: string){
-        documents(func: eq(hash, $hash)){
-          uid
+      ` 
+        query documents($hash: string){
+          documents(func: eq(hash, $hash))
+          ${this._configureRequest(opts || {})}
         }
-      }`,
+      `,
       { $hash: docHash }
     )
-    return documents.length ? documents[0].uid : null
+    return documents.length ? documents[0] : null
+  }
+
+  _configureRequest ({
+    contentGroups = true,
+    certificates = true
+  }) {
+    return `
+      {
+        uid,
+        hash,
+        created_date,
+        ${contentGroups ? contentGroupsRequest : ''}
+        ${certificates ? certificatesRequest : ''}
+      }
+    `
+  }
+
+  async getHashUIDMap (docHash) {
+    docHash = Util.removeDuplicates(docHash)
+    const { documents } = await this.dgraph.query(
+      `
+      {
+        documents(func: eq(hash, [${docHash.join(',')}])){
+          uid,
+          hash
+        }
+      }
+      `,
+      { $hash: docHash }
+    )
+    return Util.toKeyValue(documents, 'hash', 'uid')
   }
 
   async store (chainDoc) {
-    const uid = await this.getUID(chainDoc.hash)
-    const dgraphDoc = this._transform(chainDoc, uid)
-
+    const currentDoc = await this.getByHash(chainDoc.hash, { contentGroups: false })
+    const dgraphDoc = await (currentDoc ? this._transformUpdate(chainDoc, currentDoc) : this._transformNew(chainDoc))
     return dgraphDoc ? this.dgraph.updateData(dgraphDoc) : null
   }
 
-  _transform (chainDoc, uid) {
+  async _transformNew (chainDoc) {
     const {
       hash,
       creator,
@@ -107,29 +165,39 @@ class Document {
     if (!contentGroups) {
       return null
     }
-    let transformed
 
-    if (uid) {
-      transformed = {
-        uid
-      }
-    } else {
-      transformed = {
-        hash,
-        creator,
-        created_date: createdDate,
-        content_groups: this._transformContentGroups(contentGroups)
-      }
-    }
     return {
-      ...transformed,
+      hash,
+      creator,
+      created_date: createdDate,
+      content_groups: await this._transformContentGroups(contentGroups),
       certificates: this._transformCertificates(certificates),
       'dgraph.type': 'Document'
 
     }
   }
 
-  _transformContentGroups (chainContentGroups) {
+  async _transformUpdate (chainDoc, currentDoc) {
+    const {
+      certificates: newCertificates
+    } = chainDoc
+
+    let {
+      uid,
+      certificates: oldCertificates
+    } = currentDoc
+
+    oldCertificates = oldCertificates || []
+
+    return {
+      uid,
+      certificates: oldCertificates.concat(this._transformCertificates(newCertificates, oldCertificates.length)),
+      'dgraph.type': 'Document'
+
+    }
+  }
+
+  async _transformContentGroups (chainContentGroups) {
     const contentGroups = chainContentGroups.map((contentGroup, index) => {
       return {
         content_group_sequence: index,
@@ -137,6 +205,7 @@ class Document {
         'dgraph.type': 'ContentGroup'
       }
     })
+    await this._addDocumentEdges(contentGroups)
     return contentGroups
   }
 
@@ -158,13 +227,42 @@ class Document {
     return contents
   }
 
-  _transformCertificates (chainCertificates) {
+  _transformCertificates (chainCertificates, startIndex = 0) {
     chainCertificates = chainCertificates || []
-    const certificates = chainCertificates.map((certificate) => ({
-      ...certificate,
-      'dgraph.type': 'Certificate'
-    }))
+    const certificates = []
+    for (let i = startIndex; i < chainCertificates.length; i++) {
+      certificates.push({
+        ...chainCertificates[i],
+        certification_sequence: i,
+        'dgraph.type': 'Certificate'
+      })
+    }
     return certificates
+  }
+
+  async _addDocumentEdges (contentGroups) {
+    const edges = []
+    const hashes = []
+    for (const contentGroup of contentGroups) {
+      for (const content of contentGroup.contents) {
+        const { type, value } = content
+        if (type === DataTypes.CHECKSUM256) {
+          edges.push(content)
+          hashes.push(value)
+        }
+      }
+    }
+    if (hashes.length) {
+      const hashUIDMap = await this.getHashUIDMap(hashes)
+      edges.forEach(edge => {
+        const uid = hashUIDMap[edge.value]
+        if (uid) {
+          edge.document = {
+            uid
+          }
+        }
+      })
+    }
   }
 }
 
