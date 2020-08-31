@@ -1,6 +1,5 @@
 const HyperionSocketClient = require('@eosrio/hyperion-stream-client').default
-const { Document } = require('./model')
-const { DGraph } = require('./service')
+const { Document, DGraph } = require('@smontero/document-cache')
 
 async function run () {
   const dgraph = new DGraph({})
