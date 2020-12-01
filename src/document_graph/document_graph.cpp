@@ -108,6 +108,11 @@ namespace hypha
 
     void DocumentGraph::replaceNode(const eosio::checksum256 &oldNode, const eosio::checksum256 &newNode)
     {
+        if (oldNode != newNode) 
+        {
+            return;
+        }
+
         Edge::edge_table e_t(m_contract, m_contract.value);
 
         auto from_node_index = e_t.get_index<eosio::name("fromnode")>();
@@ -145,7 +150,6 @@ namespace hypha
         // should take place in contract proper and not DocumentGraph"ß
         // require_auth(updater);
 
-        Document currentDocument(m_contract, documentHash);
         Document newDocument(m_contract, updater, contentGroups);
         newDocument.emplace();
 
